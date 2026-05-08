@@ -1,0 +1,320 @@
+#!/bin/bash
+# =====================================================
+# github-accel — GitHub 加速开关脚本
+# start: 加速 + 监听浏览器窗口，关闭自动下线
+# stop:  手动下线
+# clean: 深度清洗 /etc/hosts 中所有 github 相关条目
+# status:查看状态
+#
+# 环境变量:
+#   GITHUB_ACCEL_BROWSER=edge|chrome|safari|none  (默认: edge)
+# =====================================================
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+FASTIP_PY="$SCRIPT_DIR/scripts/github-fastip.py"
+PIDFILE="/tmp/github-accel-watch.pid"
+HOSTS_APPEND="/tmp/github_hosts_raw_only.txt"
+HOSTS_MARKER="# --- github-fastip managed ---"
+
+# ─── 浏览器配置 ──────────────────────────────────────────
+BROWSER="${GITHUB_ACCEL_BROWSER:-edge}"
+
+# ─── 颜色 ────────────────────────────────────────────────
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+NC='\033[0m'
+ok()   { echo -e "${GREEN}[✓]${NC} $1"; }
+info() { echo -e "${YELLOW}[*]${NC} $1"; }
+err()  { echo -e "${RED}[✗]${NC} $1"; }
+
+# ─── hosts 操作 ───────────────────────────────────────────
+deep_clean_hosts() {
+    local changed=0
+    for pattern in "github.com" "githubusercontent" "gist.github" "assets-cdn.github" "fastip" "accel" "managed"; do
+        if grep -qi "$pattern" /etc/hosts 2>/dev/null; then
+            sudo sed -i '' "/$pattern/Id" /etc/hosts 2>/dev/null
+            changed=1
+        fi
+    done
+    if [ "$changed" = "1" ]; then
+        ok "已深度清洗 /etc/hosts 所有 github 相关条目"
+    else
+        info "/etc/hosts 已无 github 残留"
+    fi
+}
+
+deep_clean_and_backup() {
+    sudo cp /etc/hosts /etc/hosts.bak.github-accel 2>/dev/null
+    deep_clean_hosts
+}
+
+install_hosts() {
+    if [ ! -f "$HOSTS_APPEND" ]; then
+        err "未找到 hosts 规则文件: $HOSTS_APPEND"
+        return 1
+    fi
+    deep_clean_and_backup
+    sudo sh -c "cat '$HOSTS_APPEND' >> /etc/hosts"
+    ok "加速规则已写入 /etc/hosts"
+}
+
+# ─── 浏览器窗口检测 (通用) ───────────────────────────────
+edge_window_count() {
+    osascript -e '
+tell application "System Events"
+    set edgeProcs to every process whose name contains "Microsoft Edge"
+    set totalWindows to 0
+    repeat with p in edgeProcs
+        try
+            set totalWindows to totalWindows + (count of windows of p)
+        end try
+    end repeat
+    return totalWindows
+end tell' 2>/dev/null || echo 0
+}
+
+edge_is_running() {
+    [ "$(edge_window_count)" -gt 0 ]
+}
+
+chrome_window_count() {
+    osascript -e '
+tell application "System Events"
+    set chromeProcs to every process whose name contains "Google Chrome"
+    set totalWindows to 0
+    repeat with p in chromeProcs
+        try
+            set totalWindows to totalWindows + (count of windows of p)
+        end try
+    end repeat
+    return totalWindows
+end tell' 2>/dev/null || echo 0
+}
+
+chrome_is_running() {
+    [ "$(chrome_window_count)" -gt 0 ]
+}
+
+safari_window_count() {
+    osascript -e '
+tell application "System Events"
+    set safariProcs to every process whose name contains "Safari"
+    set totalWindows to 0
+    repeat with p in safariProcs
+        try
+            set totalWindows to totalWindows + (count of windows of p)
+        end try
+    end repeat
+    return totalWindows
+end tell' 2>/dev/null || echo 0
+}
+
+safari_is_running() {
+    [ "$(safari_window_count)" -gt 0 ]
+}
+
+browser_window_count() {
+    case "$BROWSER" in
+        edge)   edge_window_count ;;
+        chrome) chrome_window_count ;;
+        safari) safari_window_count ;;
+        none)   echo 0 ;;
+        *)      edge_window_count ;;
+    esac
+}
+
+browser_is_running() {
+    case "$BROWSER" in
+        edge)   edge_is_running ;;
+        chrome) chrome_is_running ;;
+        safari) safari_is_running ;;
+        none)   return 0 ;;  # no watcher, always "running"
+        *)      edge_is_running ;;
+    esac
+}
+
+browser_name() {
+    case "$BROWSER" in
+        edge)   echo "Edge" ;;
+        chrome) echo "Chrome" ;;
+        safari) echo "Safari" ;;
+        none)   echo "无" ;;
+        *)      echo "Edge" ;;
+    esac
+}
+
+# ─── 监听循环 ─────────────────────────────────────────────
+start_watcher() {
+    if [ "$BROWSER" = "none" ]; then
+        info "GITHUB_ACCEL_BROWSER=none，不启动浏览器监听"
+        info "请手动执行 'github-accel stop' 或 'github-accel clean' 下线"
+        return 0
+    fi
+
+    if [ -f "$PIDFILE" ]; then
+        oldpid=$(cat "$PIDFILE")
+        kill "$oldpid" 2>/dev/null
+        rm -f "$PIDFILE"
+    fi
+    (
+        while true; do
+            if ! browser_is_running; then
+                bname=$(browser_name)
+                info "$bname 窗口已全部关闭，自动下线..."
+                deep_clean_hosts 2>/dev/null
+                ok "已恢复默认 DNS 解析"
+                rm -f "$PIDFILE"
+                exit 0
+            fi
+            sleep 3
+        done
+    ) &
+    echo $! > "$PIDFILE"
+    ok "后台监听已启动 (PID: $(cat $PIDFILE), 浏览器: $(browser_name))"
+}
+
+stop_watcher() {
+    if [ -f "$PIDFILE" ]; then
+        kill "$(cat "$PIDFILE")" 2>/dev/null
+        rm -f "$PIDFILE"
+        ok "监听已停止"
+    fi
+}
+
+# ─── status ────────────────────────────────────────────────
+show_status() {
+    echo ""
+    echo "========================================"
+    echo " GitHub 加速状态"
+    echo "========================================"
+
+    if grep -q "$HOSTS_MARKER" /etc/hosts 2>/dev/null; then
+        ok "加速规则: 已激活"
+        grep -A100 "$HOSTS_MARKER" /etc/hosts | grep -v "$HOSTS_MARKER" | grep -v "^#" | grep -v "^$" | while read line; do
+            echo "    $line"
+        done
+    elif grep -q "github" /etc/hosts 2>/dev/null; then
+        err "加速规则: 存在残留"
+        grep -n "github" /etc/hosts | while read line; do
+            echo "    $line"
+        done
+        echo ""
+        info "执行 'github-accel clean' 清理"
+    else
+        info "加速规则: 未激活"
+    fi
+
+    if [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null; then
+        ok "后台监听: 运行中 (PID: $(cat "$PIDFILE"))"
+    else
+        info "后台监听: 未运行"
+    fi
+
+    bname=$(browser_name)
+    wc=$(browser_window_count)
+    if [ "$BROWSER" = "none" ]; then
+        info "浏览器监听: 已禁用 (GITHUB_ACCEL_BROWSER=none)"
+    elif [ "$wc" -gt 0 ]; then
+        ok "$bname 窗口: $wc 个"
+    else
+        info "$bname 窗口: 无"
+    fi
+
+    echo ""
+    echo "--- 延迟实测 ---"
+    for domain in github.com api.github.com raw.githubusercontent.com; do
+        t=$(curl -sI --max-time 3 "https://$domain" -o /dev/null -w "%{http_code} %{time_total}s" 2>/dev/null)
+        ip=$(dig +short "$domain" 2>/dev/null | head -1)
+        if [ -z "$ip" ]; then ip="N/A"; fi
+        echo "  $domain -> $ip ($t)"
+    done
+    echo ""
+}
+
+# ─── 主逻辑 ───────────────────────────────────────────────
+case "${1:-status}" in
+    start)
+        info "步骤1: 深度清洗旧 hosts..."
+        deep_clean_and_backup
+
+        info "步骤2: 扫描 GitHub IP..."
+        python3 "$FASTIP_PY" --scan-only --output "$HOSTS_APPEND"
+        if [ ! -f "$HOSTS_APPEND" ]; then
+            info "扫描未生成结果文件，重试（忽略缓存）..."
+            python3 "$FASTIP_PY" --scan-only --output "$HOSTS_APPEND" --no-cache
+        fi
+
+        if [ ! -f "$HOSTS_APPEND" ]; then
+            err "扫描失败：无法获取可用 IP"
+            err "请检查网络连接和 DNS 解析是否正常"
+            err "提示：尝试 ping raw.githubusercontent.com 确认网络可达"
+            exit 2
+        fi
+
+        rule_count=$(grep -c 'raw\.github' "$HOSTS_APPEND" 2>/dev/null || echo 0)
+        if [ "$rule_count" -eq 0 ]; then
+            info "当前网络环境无合适的加速 IP，仅保留 raw.githubusercontent.com 加速"
+            cat > "$HOSTS_APPEND" <<'EOF'
+# --- github-fastip managed ---
+# Generated by github-accel (fallback: raw.githubusercontent.com only)
+185.199.111.7\traw.githubusercontent.com
+# --- github-fastip managed ---
+EOF
+            ok "已生成保底规则（仅 raw.githubusercontent.com）"
+        fi
+
+        bname=$(browser_name)
+        if [ "$BROWSER" != "none" ]; then
+            info "步骤3: 检查 $bname..."
+            if ! browser_is_running; then
+                err "$bname 浏览器未运行，请先打开 $bname"
+                err "或设置 GITHUB_ACCEL_BROWSER=none 跳过浏览器检测"
+                exit 1
+            fi
+            ok "$bname 浏览器运行中 ($(browser_window_count) 个窗口)"
+        fi
+
+        info "步骤4: 写入 hosts（需要管理员密码）..."
+        install_hosts || exit 1
+
+        info "步骤5: 启动浏览器窗口监听..."
+        start_watcher
+
+        echo ""
+        ok "GitHub 加速已激活！$(browser_name) 关闭后自动下线。"
+        echo "  手动下线: github-accel stop"
+        echo "  查看状态: github-accel status"
+        echo "  切换浏览器: GITHUB_ACCEL_BROWSER=chrome github-accel start"
+        ;;
+
+    stop)
+        info "手动下线..."
+        stop_watcher
+        deep_clean_hosts
+        ok "已恢复默认 DNS 解析"
+        ;;
+
+    clean)
+        info "深度清洗 /etc/hosts..."
+        deep_clean_and_backup
+        ok "已清理所有 github 相关 hosts 条目"
+        ;;
+
+    status)
+        show_status
+        ;;
+
+    *)
+        echo "用法: ./github-accel {start|stop|clean|status}"
+        echo ""
+        echo "  start    扫描 + 写入 hosts + 浏览器窗口监听"
+        echo "  stop     手动下线，恢复默认 DNS"
+        echo "  clean    深度清洗 /etc/hosts 残留"
+        echo "  status   查看当前状态"
+        echo ""
+        echo "环境变量:"
+        echo "  GITHUB_ACCEL_BROWSER=edge|chrome|safari|none"
+        echo "    默认: edge"
+        exit 1
+        ;;
+esac
